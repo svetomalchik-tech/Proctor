@@ -1,0 +1,22 @@
+# Proctoring Service Configuration
+# Add to your application.yml or application.properties
+
+proctoring:
+  # Base URL прокторинг сервиса
+  base-url: http://localhost:8000/api/v1
+  
+  # API ключ для аутентификации (опционально, если используется JWT)
+  api-key: ${PROCTORING_API_KEY:your-api-key-here}
+  
+  # Таймауты
+  connection-timeout-ms: 5000
+  read-timeout-ms: 30000
+  
+  # Настройки retry
+  max-retries: 3
+  retry-delay-ms: 1000
+
+# Пример конфигурации для production
+# proctoring:
+#   base-url: https://proctoring.corporate.local/api/v1
+#   api-key: ${PROCTORING_API_KEY}

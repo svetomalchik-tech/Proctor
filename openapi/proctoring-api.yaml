@@ -1,0 +1,689 @@
+openapi: 3.0.3
+info:
+  title: Proctoring System API
+  description: |
+    REST API для системы прокторинга корпоративного обучения.
+    
+    ## Интеграция с Java (Spring Boot)
+    
+    Для интеграции используйте JWT аутентификацию и предоставленные endpoint'ы.
+    Все запросы должны содержать заголовок `Authorization: Bearer <jwt_token>`.
+  version: 2.0.0
+  contact:
+    name: Proctoring Team
+    email: proctoring@corporate.local
+
+servers:
+  - url: https://proctoring.corporate.local/api/v1
+    description: Production server
+  - url: http://localhost:8000/api/v1
+    description: Development server
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: sessions
+    description: Управление сессиями прокторинга
+  - name: reports
+    description: Отчёты и аналитика
+  - name: admin
+    description: Административные операции
+  - name: webhooks
+    description: Настройка webhook уведомлений
+
+paths:
+  /health:
+    get:
+      summary: Проверка здоровья сервиса
+      operationId: healthCheck
+      tags:
+        - sessions
+      responses:
+        '200':
+          description: Сервис доступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /proctoring/start:
+    post:
+      summary: Начать сессию прокторинга
+      description: |
+        Создаёт новую сессию прокторинга для пользователя.
+        
+        Возвращает session_id, который используется для:
+        - WebSocket подключения для стриминга видео
+        - Завершения сессии
+        - Получения отчёта
+      operationId: startProctoringSession
+      tags:
+        - sessions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartSessionRequest'
+      responses:
+        '201':
+          description: Сессия успешно создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '400':
+          description: Ошибка валидации запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Неавторизованный запрос
+        '500':
+          description: Внутренняя ошибка сервера
+
+  /proctoring/{session_id}/stop:
+    post:
+      summary: Завершить сессию прокторинга
+      description: |
+        Завершает активную сессию и генерирует итоговый отчёт.
+        
+        После вызова этого endpoint:
+        - WebSocket соединение закрывается
+        - Генерируется финальный отчёт
+        - Отправляется webhook в корпоративную систему (если настроен)
+      operationId: stopProctoringSession
+      tags:
+        - sessions
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Сессия успешно завершена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndSessionResponse'
+        '404':
+          description: Сессия не найдена
+        '409':
+          description: Сессия уже завершена
+
+  /proctoring/{session_id}:
+    get:
+      summary: Получить информацию о сессии
+      operationId: getSessionInfo
+      tags:
+        - sessions
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Информация о сессии
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '404':
+          description: Сессия не найдена
+
+  /proctoring/{session_id}/report:
+    get:
+      summary: Получить полный отчёт по сессии
+      description: |
+        Возвращает детальный отчёт включая:
+        - Все зафиксированные нарушения
+        - Временную шкалу событий
+        - Оценку рисков
+        - Ссылки на видео записи
+      operationId: getSessionReport
+      tags:
+        - reports
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: include_video_urls
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+          description: Включить presigned URLs для видео
+      responses:
+        '200':
+          description: Полный отчёт по сессии
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionReport'
+        '404':
+          description: Сессия не найдена
+
+  /proctoring/{session_id}/risk-assessment:
+    get:
+      summary: Получить оценку рисков
+      description: |
+        Возвращает расчётный уровень риска cheating на основе:
+        - Количества нарушений
+        - Типа нарушений (веса по severity)
+        - Временных паттернов
+      operationId: getRiskAssessment
+      tags:
+        - reports
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Оценка рисков
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskAssessment'
+        '404':
+          description: Сессия не найдена
+
+  /admin/sessions:
+    get:
+      summary: Список всех сессий (Admin)
+      description: |
+        Возвращает пагинированный список сессий с фильтрацией.
+        
+        Доступные фильтры:
+        - status: фильтрация по статусу
+        - exam_id: по конкретному экзамену
+        - user_id: по пользователю
+        - date_from/date_to: диапазон дат
+        - min_risk_score: минимальный риск
+      operationId: listSessions
+      tags:
+        - admin
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, active, completed, violated]
+        - name: exam_id
+          in: query
+          schema:
+            type: string
+        - name: user_id
+          in: query
+          schema:
+            type: string
+        - name: date_from
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: date_to
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: min_risk_score
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        '200':
+          description: Список сессий
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionsListResponse'
+
+  /admin/sessions/{session_id}/video:
+    get:
+      summary: Получить видео сессии (Admin)
+      operationId: getSessionVideo
+      tags:
+        - admin
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [camera, screen, picture-in-picture]
+      responses:
+        '200':
+          description: Video stream или presigned URL
+          content:
+            video/mp4:
+              schema:
+                type: string
+                format: binary
+            application/json:
+              schema:
+                type: object
+                properties:
+                  download_url:
+                    type: string
+                    format: uri
+                  expires_at:
+                    type: string
+                    format: date-time
+        '404':
+          description: Видео не найдено
+
+  /admin/webhooks:
+    post:
+      summary: Зарегистрировать webhook
+      operationId: registerWebhook
+      tags:
+        - webhooks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookConfig'
+      responses:
+        '201':
+          description: Webhook зарегистрирован
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookConfig'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: healthy
+        version:
+          type: string
+          example: 2.0.0
+        timestamp:
+          type: string
+          format: date-time
+
+    StartSessionRequest:
+      type: object
+      required:
+        - user_id
+        - exam_id
+      properties:
+        user_id:
+          type: string
+          description: ID пользователя в корпоративной системе
+          example: emp-12345
+        exam_id:
+          type: string
+          description: ID экзамена/теста
+          example: exam-java-certification-2024
+        settings:
+          type: object
+          description: Опциональные настройки сессии
+          properties:
+            duration_minutes:
+              type: integer
+              description: Максимальная длительность сессии
+              example: 60
+            allowed_apps:
+              type: array
+              items:
+                type: string
+              description: Список разрешённых приложений
+              example: ["IntelliJ IDEA", "Chrome"]
+            require_fullscreen:
+              type: boolean
+              default: true
+            detection_sensitivity:
+              type: string
+              enum: [low, medium, high]
+              default: medium
+
+    SessionResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+          format: uuid
+          example: 550e8400-e29b-41d4-a716-446655440000
+        user_id:
+          type: string
+          example: emp-12345
+        exam_id:
+          type: string
+          example: exam-java-certification-2024
+        status:
+          type: string
+          enum: [pending, active, paused, completed, violated]
+        started_at:
+          type: string
+          format: date-time
+        websocket_url:
+          type: string
+          format: uri
+          description: URL для WebSocket подключения
+          example: ws://localhost:8000/api/v1/ws/550e8400-e29b-41d4-a716-446655440000
+        consent_required:
+          type: boolean
+          description: Требуется ли согласие пользователя на запись
+
+    EndSessionResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [completed, violated]
+        total_duration_sec:
+          type: number
+          example: 3542.5
+        total_violations:
+          type: integer
+          example: 5
+        violations_by_type:
+          type: object
+          additionalProperties:
+            type: integer
+          example:
+            "gaze_avoided": 2
+            "tab_switched": 2
+            "fullscreen_exited": 1
+        risk_score:
+          type: integer
+          minimum: 0
+          maximum: 100
+          example: 45
+        report_available:
+          type: boolean
+
+    SessionReport:
+      type: object
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+        exam_id:
+          type: string
+        status:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+        duration_sec:
+          type: number
+        risk_score:
+          type: integer
+        risk_level:
+          type: string
+          enum: [low, medium, high, critical]
+        summary:
+          type: object
+          properties:
+            total_violations:
+              type: integer
+            violations_by_severity:
+              type: object
+              additionalProperties:
+                type: integer
+              example:
+                "low": 2
+                "medium": 2
+                "high": 1
+            violations_by_type:
+              type: object
+              additionalProperties:
+                type: integer
+        violations:
+          type: array
+          items:
+            $ref: '#/components/schemas/ViolationEvent'
+        timeline:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimelineEvent'
+        video_urls:
+          type: object
+          properties:
+            camera_recording:
+              type: string
+              format: uri
+            screen_recording:
+              type: string
+              format: uri
+          description: Presigned URLs для скачивания видео (действуют 1 час)
+
+    ViolationEvent:
+      type: object
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+        type:
+          type: string
+          enum:
+            - face_absent
+            - multi_face
+            - gaze_avoided
+            - head_turned
+            - phone_detected
+            - tab_switched
+            - app_changed
+            - fullscreen_exited
+            - messenger_detected
+            - audio_anomaly
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          example: 0.87
+        description:
+          type: string
+          example: "Пользователь отвёл взгляд от экрана на 5.2 секунды"
+        metadata:
+          type: object
+          additionalProperties: true
+          example:
+            duration_sec: 5.2
+            head_pose: { yaw: 45.3, pitch: 12.1, roll: 2.3 }
+        frame_snapshot_url:
+          type: string
+          format: uri
+          description: URL скриншота момента нарушения
+
+    TimelineEvent:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        event_type:
+          type: string
+          enum: [session_start, violation, warning, session_end, connection_lost, connection_restored]
+        description:
+          type: string
+        severity:
+          type: string
+          enum: [info, low, medium, high, critical]
+
+    RiskAssessment:
+      type: object
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        risk_score:
+          type: integer
+          minimum: 0
+          maximum: 100
+        risk_level:
+          type: string
+          enum: [low, medium, high, critical]
+        factors:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                example: "gaze_avoidance_frequency"
+              weight:
+                type: number
+                example: 0.3
+              score:
+                type: number
+                example: 0.7
+              contribution:
+                type: number
+                example: 0.21
+        recommendation:
+          type: string
+          enum: [approve, manual_review, reject]
+          description: Рекомендация по результатам сессии
+        details:
+          type: string
+          example: "Высокая частота отведения взгляда и переключения вкладок"
+
+    SessionsListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionSummary'
+        pagination:
+          type: object
+          properties:
+            page:
+              type: integer
+            page_size:
+              type: integer
+            total_items:
+              type: integer
+            total_pages:
+              type: integer
+
+    SessionSummary:
+      type: object
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+        exam_id:
+          type: string
+        status:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        duration_sec:
+          type: number
+        violation_count:
+          type: integer
+        risk_score:
+          type: integer
+
+    WebhookConfig:
+      type: object
+      required:
+        - url
+        - events
+      properties:
+        url:
+          type: string
+          format: uri
+          description: URL для получения webhook уведомлений
+          example: https://corp-platform.local/api/webhooks/proctoring
+        events:
+          type: array
+          items:
+            type: string
+            enum: [session_started, session_completed, violation_critical, risk_high]
+          description: События для которых отправлять уведомления
+        secret:
+          type: string
+          description: Secret для подписи webhook payload (HMAC-SHA256)
+        active:
+          type: boolean
+          default: true
+
+    ErrorResponse:
+      type: object
+      properties:
+        error_code:
+          type: string
+          example: VALIDATION_ERROR
+        message:
+          type: string
+          example: "Invalid request parameters"
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string

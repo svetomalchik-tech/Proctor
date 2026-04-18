@@ -1,0 +1,139 @@
+version: '3.8'
+
+services:
+  # PostgreSQL - хранение метаданных сессий и событий
+  postgres:
+    image: postgres:15-alpine
+    container_name: proctoring-postgres
+    environment:
+      POSTGRES_USER: proctoring
+      POSTGRES_PASSWORD: proctoring_secret
+      POSTGRES_DB: proctoring
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/app/storage/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proctoring"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - proctoring-network
+
+  # Redis - кэширование и session storage
+  redis:
+    image: redis:7-alpine
+    container_name: proctoring-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - proctoring-network
+
+  # MinIO - S3-compatible хранилище для видео
+  minio:
+    image: minio/minio:latest
+    container_name: proctoring-minio
+    environment:
+      MINIO_ROOT_USER: proctoring_admin
+      MINIO_ROOT_PASSWORD: proctoring_minio_secret
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"  # API
+      - "9001:9001"  # Console
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - proctoring-network
+
+  # Backend - FastAPI сервис прокторинга
+  proctoring-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: proctoring-backend
+    environment:
+      # Database
+      DATABASE_URL: postgresql://proctoring:proctoring_secret@postgres:5432/proctoring
+      
+      # Redis
+      REDIS_URL: redis://redis:6379
+      
+      # MinIO/S3
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: proctoring_admin
+      S3_SECRET_KEY: proctoring_minio_secret
+      S3_BUCKET: proctoring-recordings
+      
+      # Application
+      HOST: 0.0.0.0
+      PORT: 8000
+      LOG_LEVEL: INFO
+      
+      # Security
+      JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      API_KEY: ${PROCTORING_API_KEY:-dev-api-key}
+      
+      # Detection settings
+      EYE_AWAY_THRESHOLD_SEC: 3.0
+      HEAD_TURN_THRESHOLD_DEG: 30.0
+      PHONE_DETECTION_CONFIDENCE: 0.7
+      MULTI_FACE_DETECTION: "true"
+      TAB_SWITCH_DETECTION: "true"
+      FULLSCREEN_REQUIRED: "true"
+      
+      # Webhook
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./backend/app/storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - proctoring-network
+    restart: unless-stopped
+
+  # Admin Panel - React SPA
+  proctoring-admin:
+    build:
+      context: ./admin-panel
+      dockerfile: Dockerfile
+    container_name: proctoring-admin
+    ports:
+      - "3000:80"
+    depends_on:
+      - proctoring-backend
+    networks:
+      - proctoring-network
+    restart: unless-stopped
+
+networks:
+  proctoring-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
