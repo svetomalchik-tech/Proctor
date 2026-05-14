@@ -1,5 +1,5 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Depends
-from typing import Dict, Optional
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Depends, Query
+from typing import Dict, Optional, List
 import asyncio
 import json
 import base64
@@ -13,6 +13,9 @@ from app.models.schemas import (
 from app.detectors.face_detector import FaceMeshDetector, decode_frame_from_base64
 from app.detectors.screen_detector import ScreenAnalyzer
 from config import settings
+from app.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 router = APIRouter()
@@ -44,6 +47,8 @@ async def start_session(request: StartSessionRequest) -> ProctorSession:
     """Начало новой сессии прокторинга"""
     session_id = str(uuid.uuid4())
     
+    logger.info("Starting new proctoring session for user %s, exam %s", request.user_id, request.exam_id)
+    
     session = ProctorSession(
         session_id=session_id,
         user_id=request.user_id,
@@ -53,6 +58,7 @@ async def start_session(request: StartSessionRequest) -> ProctorSession:
     )
     
     active_sessions[session_id] = session
+    logger.info("Session %s created successfully", session_id)
     
     return session
 
@@ -60,7 +66,9 @@ async def start_session(request: StartSessionRequest) -> ProctorSession:
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str) -> ProctorSession:
     """Получение информации о сессии"""
+    logger.debug("Getting session info for %s", session_id)
     if session_id not in active_sessions:
+        logger.warning("Session %s not found", session_id)
         raise HTTPException(status_code=404, detail="Сессия не найдена")
     
     return active_sessions[session_id]
@@ -69,7 +77,9 @@ async def get_session(session_id: str) -> ProctorSession:
 @router.post("/sessions/{session_id}/end")
 async def end_session(session_id: str) -> EndSessionResponse:
     """Завершение сессии"""
+    logger.info("Ending session %s", session_id)
     if session_id not in active_sessions:
+        logger.warning("Attempted to end non-existent session %s", session_id)
         raise HTTPException(status_code=404, detail="Сессия не найдена")
     
     session = active_sessions[session_id]
@@ -95,6 +105,7 @@ async def end_session(session_id: str) -> EndSessionResponse:
     # Удаляем сессию из активных (или перемещаем в архив)
     del active_sessions[session_id]
     
+    logger.info("Session %s ended with %d violations", session_id, len(session.violations))
     return response
 
 
@@ -112,9 +123,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     - Результаты анализа в реальном времени
     - Предупреждения о нарушениях
     """
+    logger.info("WebSocket connection attempt for session %s", session_id)
     await websocket.accept()
     
     if session_id not in active_sessions:
+        logger.warning("WebSocket rejected: session %s not found", session_id)
         await websocket.close(code=4004, reason="Сессия не найдена")
         return
     
@@ -124,6 +137,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     session.status = SessionStatus.ACTIVE
     if not session.started_at:
         session.started_at = datetime.utcnow()
+    
+    logger.info("WebSocket session %s started for user %s", session_id, session.user_id)
     
     face_det = get_face_detector()
     screen_an = get_screen_analyzer()
@@ -192,27 +207,34 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             elif msg_type == "violation_warning":
                 # Клиент получил предупреждение о нарушении
                 violation_id = data.get("violation_id")
-                # Логирование или дополнительная обработка
-                
+                logger.debug("Client acknowledged violation warning: %s", violation_id)
+            
     except WebSocketDisconnect:
         # Клиент отключился
+        logger.info("WebSocket disconnected for session %s", session_id)
         session.status = SessionStatus.COMPLETED
         session.ended_at = datetime.utcnow()
         
     except Exception as e:
         # Обработка ошибок
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e)
-        })
+        logger.error("Error in WebSocket session %s: %s", session_id, str(e), exc_info=True)
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e)
+            })
+        except:
+            pass
         session.status = SessionStatus.VIOLATED
 
 
 @router.get("/sessions/{session_id}/violations")
 async def get_session_violations(session_id: str):
     """Получение списка нарушений сессии"""
+    logger.debug("Getting violations for session %s", session_id)
     if session_id not in active_sessions:
         # Попробуем найти в завершенных (в реальной системе - в БД)
+        logger.warning("Session %s not found in active sessions", session_id)
         raise HTTPException(status_code=404, detail="Сессия не найдена")
     
     session = active_sessions[session_id]
@@ -226,8 +248,12 @@ async def get_session_violations(session_id: str):
 @router.on_event("shutdown")
 async def shutdown_event():
     """Очистка ресурсов при завершении работы"""
+    logger.info("Cleaning up proctoring resources...")
     global face_detector, screen_analyzer
     if face_detector:
         face_detector.close()
+        logger.info("Face detector closed")
     if screen_analyzer:
         screen_analyzer.reset()
+        logger.info("Screen analyzer reset")
+    logger.info("Cleanup complete")
