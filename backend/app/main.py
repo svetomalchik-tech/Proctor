@@ -12,9 +12,10 @@ import asyncio
 
 from app.api import proctoring
 from app.config import settings
-from app.services.session_manager import ProctoringSessionManager, active_sessions, create_session, remove_session
+from app.services.session_manager import ProctoringSessionManager, active_sessions, create_session, remove_session, get_active_session_ids, get_session_count
 from app.core.logging_config import logger, get_logger
 from app.core.rate_limiter import RateLimitMiddleware
+from app.core.redis_client import init_redis, close_redis, redis_client
 
 # Инициализация логирования
 logger.info("Starting Proctoring System v2.0.0")
@@ -68,10 +69,15 @@ async def root(request: Request):
 @app.get("/health")
 async def health_check():
     """Health check with session stats"""
-    logger.debug("Health check performed, active sessions: %d", len(active_sessions))
+    # Get session count from Redis if available, otherwise from memory
+    session_count = await get_session_count()
+    redis_status = "connected" if redis_client.is_connected else "disconnected"
+    
+    logger.debug("Health check performed, active sessions: %d, Redis: %s", session_count, redis_status)
     return {
         "status": "healthy",
-        "active_sessions": len(active_sessions),
+        "active_sessions": session_count,
+        "redis_status": redis_status,
         "timestamp": time.time()
     }
 
@@ -113,7 +119,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 async def get_session_status(session_id: str):
     """Get real-time status of a proctoring session"""
     logger.debug("Getting status for session %s", session_id)
-    session = active_sessions.get(session_id)
+    
+    # Try to get session (now async)
+    session = await get_session(session_id)
     if not session:
         logger.warning("Session %s not found", session_id)
         raise HTTPException(status_code=404, detail="Session not found or inactive")
@@ -125,13 +133,21 @@ async def get_session_status(session_id: str):
 async def terminate_session(session_id: str):
     """Manually terminate a proctoring session"""
     logger.info("Manual termination requested for session %s", session_id)
-    if session_id not in active_sessions:
+    
+    # Check if session exists (using async get)
+    session = await get_session(session_id)
+    if not session:
         logger.warning("Attempted to terminate non-existent session %s", session_id)
         raise HTTPException(status_code=404, detail="Session not found")
     
-    session = active_sessions[session_id]
     report = await session.stop_session()
-    del active_sessions[session_id]
+    
+    # Remove from memory cache
+    if session_id in active_sessions:
+        del active_sessions[session_id]
+    
+    # Clean up Redis (handled in remove_session)
+    await remove_session(session_id)
     
     logger.info("Session %s terminated successfully", session_id)
     return {"message": "Session terminated", "report": report}
@@ -143,6 +159,13 @@ async def startup_event():
     logger.info("Proctoring System starting up...")
     logger.info("Configuration: HOST=%s, PORT=%d", settings.HOST, settings.PORT)
     logger.info("Allowed origins: %s", settings.ALLOWED_ORIGINS)
+    
+    # Initialize Redis connection
+    redis_connected = await init_redis()
+    if redis_connected:
+        logger.info("Redis storage enabled for session persistence")
+    else:
+        logger.warning("Redis not available, using in-memory storage only")
 
 
 @app.on_event("shutdown")
@@ -160,6 +183,9 @@ async def shutdown_event():
                 logger.info("Session %s stopped", session_id)
             except Exception as e:
                 logger.error("Error stopping session %s: %s", session_id, str(e))
+    
+    # Close Redis connection
+    await close_redis()
     
     logger.info("Shutdown complete")
 

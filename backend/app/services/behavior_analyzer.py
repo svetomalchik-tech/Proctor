@@ -70,7 +70,9 @@ class BehaviorAnalyzer:
         self._update_state(event)
         
         # Check for patterns periodically or on specific triggers
-        if event.event_type in ['tab_switch', 'face_detected', 'face_lost', 'phone_detected']:
+        if event.event_type in ['tab_switch', 'face_detected', 'face_lost', 'phone_detected', 
+                                 'multi_face', 'head_turned', 'gaze_avoided', 'gaze_down',
+                                 'key_press', 'mouse_move']:
             patterns = self.analyze_patterns()
             return patterns
         return []
