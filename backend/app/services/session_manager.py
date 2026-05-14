@@ -14,6 +14,9 @@ import numpy as np
 from app.services.behavior_analyzer import BehaviorAnalyzer, Event, SeverityLevel, DetectedPattern
 from app.services.cv_processor import CVProcessor
 from app.services.screen_analyzer import ScreenActivityAnalyzer, ScreenEventType
+from app.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 class ProctoringSessionManager:
     """
@@ -42,20 +45,21 @@ class ProctoringSessionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.websocket = websocket
-        print(f"Session {self.session_id} connected")
+        logger.info("Session %s connected for user %s", self.session_id, self.user_id)
         
     async def start_monitoring(self):
         """Start the main monitoring loop."""
         try:
+            logger.info("Starting monitoring for session %s", self.session_id)
             while self.is_active:
                 # Receive data from client
                 data = await self.websocket.receive_json()
                 await self._process_message(data)
         except WebSocketDisconnect:
-            print(f"Client disconnected for session {self.session_id}")
+            logger.info("Client disconnected for session %s", self.session_id)
             self.is_active = False
         except Exception as e:
-            print(f"Error in session {self.session_id}: {e}")
+            logger.error("Error in session %s: %s", self.session_id, str(e), exc_info=True)
             self.is_active = False
             
     async def _process_message(self, data: Dict):
@@ -69,9 +73,10 @@ class ProctoringSessionManager:
         elif msg_type == "heartbeat":
             await self._handle_heartbeat(data)
         elif msg_type == "consent_given":
+            logger.info("Consent given for session %s", self.session_id)
             await self._send_confirmation("Consent recorded", "info")
         else:
-            print(f"Unknown message type: {msg_type}")
+            logger.warning("Unknown message type: %s for session %s", msg_type, self.session_id)
             
     async def _handle_video_frame(self, data: Dict):
         """Process base64 encoded video frame."""
@@ -89,6 +94,7 @@ class ProctoringSessionManager:
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if frame is None:
+                logger.warning("Failed to decode frame for session %s", self.session_id)
                 return
                 
             self.video_frames_count += 1
@@ -113,28 +119,31 @@ class ProctoringSessionManager:
                         await self._send_alert(pattern)
                         
         except Exception as e:
-            print(f"Error processing video frame: {e}")
+            logger.error("Error processing video frame for session %s: %s", self.session_id, str(e), exc_info=True)
 
     async def _handle_screen_event(self, data: Dict):
         """Process screen activity events from client."""
-        screen_events = self.screen_analyzer.process_event(data)
-        
-        for event in screen_events:
-            self.events_log.append({
-                "timestamp": event.timestamp,
-                "type": event.event_type.value,
-                "severity": event.severity_score,
-                "source": "screen",
-                "details": event.details
-            })
+        try:
+            screen_events = self.screen_analyzer.process_event(data)
             
-            # Immediate feedback for critical screen events
-            if event.severity_score >= 8:
-                await self._send_alert({
-                    "type": "SCREEN_VIOLATION",
-                    "description": f"Suspicious activity: {event.event_type.value}",
-                    "severity": "HIGH"
+            for event in screen_events:
+                self.events_log.append({
+                    "timestamp": event.timestamp,
+                    "type": event.event_type.value,
+                    "severity": event.severity_score,
+                    "source": "screen",
+                    "details": event.details
                 })
+                
+                # Immediate feedback for critical screen events
+                if event.severity_score >= 8:
+                    await self._send_alert({
+                        "type": "SCREEN_VIOLATION",
+                        "description": f"Suspicious activity: {event.event_type.value}",
+                        "severity": "HIGH"
+                    })
+        except Exception as e:
+            logger.error("Error processing screen event for session %s: %s", self.session_id, str(e), exc_info=True)
 
     async def _handle_heartbeat(self, data: Dict):
         """Handle heartbeat and send back risk assessment."""
@@ -206,16 +215,22 @@ class ProctoringSessionManager:
 active_sessions: Dict[str, ProctoringSessionManager] = {}
 
 async def create_session(session_id: str, user_id: str, websocket: WebSocket) -> ProctoringSessionManager:
+    """Create a new proctoring session"""
+    logger.info("Creating new session %s for user %s", session_id, user_id)
     session = ProctoringSessionManager(session_id, user_id)
     await session.connect(websocket)
     active_sessions[session_id] = session
     return session
 
 def get_session(session_id: str) -> Optional[ProctoringSessionManager]:
+    """Get session by ID"""
     return active_sessions.get(session_id)
 
 async def remove_session(session_id: str):
+    """Remove and cleanup a session"""
     if session_id in active_sessions:
+        logger.info("Removing session %s", session_id)
         session = active_sessions[session_id]
         await session.stop_session()
         del active_sessions[session_id]
+        logger.info("Session %s removed successfully", session_id)

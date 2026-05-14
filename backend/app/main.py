@@ -2,15 +2,22 @@
 Main FastAPI Application for Proctoring System
 Implements WebSocket handling, REST API, and session management.
 """
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Optional
 import time
 import json
+import signal
+import asyncio
 
 from app.api import proctoring
 from app.config import settings
 from app.services.session_manager import ProctoringSessionManager, active_sessions, create_session, remove_session
+from app.core.logging_config import logger, get_logger
+from app.core.rate_limiter import RateLimitMiddleware
+
+# Инициализация логирования
+logger.info("Starting Proctoring System v2.0.0")
 
 app = FastAPI(
     title="Proctoring System API",
@@ -18,22 +25,30 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# CORS middleware
+# CORS middleware - безопасная конфигурация
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production specify exact domains
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+    expose_headers=["X-RateLimit-Limit", "X-RateLimit-Remaining"],
 )
+
+# Rate Limiting middleware
+if settings.RATE_LIMIT_ENABLED:
+    app.add_middleware(RateLimitMiddleware)
+    logger.info("Rate limiting enabled: %d requests per minute", settings.RATE_LIMIT_PER_MINUTE)
 
 # Register routers
 app.include_router(proctoring.router, prefix="/api/v1", tags=["proctoring"])
 
 
 @app.get("/")
-async def root():
+async def root(request: Request):
     """Health check endpoint"""
+    client_ip = request.client.host if request.client else "unknown"
+    logger.info("Health check requested from %s", client_ip)
     return {
         "status": "ok",
         "service": "Proctoring System",
@@ -53,6 +68,7 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check with session stats"""
+    logger.debug("Health check performed, active sessions: %d", len(active_sessions))
     return {
         "status": "healthy",
         "active_sessions": len(active_sessions),
@@ -69,29 +85,37 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     # Get user_id from query params or headers (in production use JWT)
     user_id = websocket.query_params.get("user_id", "anonymous")
     
+    logger.info("WebSocket connection attempt for session %s, user: %s", session_id, user_id)
+    
     # Create or get session
     if session_id not in active_sessions:
         session = await create_session(session_id, user_id, websocket)
+        logger.info("Created new session %s for user %s", session_id, user_id)
     else:
         session = active_sessions[session_id]
         await session.connect(websocket)
+        logger.info("Reconnected to existing session %s", session_id)
     
     try:
         # Start monitoring loop
         await session.start_monitoring()
     except WebSocketDisconnect:
-        print(f"WebSocket disconnected for session {session_id}")
+        logger.info("WebSocket disconnected for session %s", session_id)
+    except Exception as e:
+        logger.error("Error in session %s: %s", session_id, str(e), exc_info=True)
     finally:
         # Cleanup
         await remove_session(session_id)
-        print(f"Session {session_id} terminated")
+        logger.info("Session %s terminated and cleaned up", session_id)
 
 
 @app.get("/api/v1/sessions/{session_id}/status")
 async def get_session_status(session_id: str):
     """Get real-time status of a proctoring session"""
+    logger.debug("Getting status for session %s", session_id)
     session = active_sessions.get(session_id)
     if not session:
+        logger.warning("Session %s not found", session_id)
         raise HTTPException(status_code=404, detail="Session not found or inactive")
     
     return session.generate_report()
@@ -100,14 +124,44 @@ async def get_session_status(session_id: str):
 @app.post("/api/v1/sessions/{session_id}/terminate")
 async def terminate_session(session_id: str):
     """Manually terminate a proctoring session"""
+    logger.info("Manual termination requested for session %s", session_id)
     if session_id not in active_sessions:
+        logger.warning("Attempted to terminate non-existent session %s", session_id)
         raise HTTPException(status_code=404, detail="Session not found")
     
     session = active_sessions[session_id]
     report = await session.stop_session()
     del active_sessions[session_id]
     
+    logger.info("Session %s terminated successfully", session_id)
     return {"message": "Session terminated", "report": report}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Application startup handler"""
+    logger.info("Proctoring System starting up...")
+    logger.info("Configuration: HOST=%s, PORT=%d", settings.HOST, settings.PORT)
+    logger.info("Allowed origins: %s", settings.ALLOWED_ORIGINS)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Graceful shutdown handler"""
+    logger.info("Proctoring System shutting down...")
+    
+    # Gracefully stop all active sessions
+    if active_sessions:
+        logger.info("Terminating %d active sessions...", len(active_sessions))
+        for session_id in list(active_sessions.keys()):
+            try:
+                session = active_sessions[session_id]
+                await session.stop_session()
+                logger.info("Session %s stopped", session_id)
+            except Exception as e:
+                logger.error("Error stopping session %s: %s", session_id, str(e))
+    
+    logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
